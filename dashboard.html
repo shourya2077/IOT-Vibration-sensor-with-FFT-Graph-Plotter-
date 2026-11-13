@@ -1,0 +1,550 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Vibration DAQ</title>
+<style>
+  /* ---- Design tokens ------------------------------------------------
+     Industrial instrument-panel palette: graphite panel, warm amber as
+     the primary signal color (analog-meter feel), teal + rose for the
+     other two axes. No external fonts/CDNs -- the ESP32 access point
+     has no internet route, so everything here must be self-contained.
+  --------------------------------------------------------------------*/
+  :root {
+    --bg: #14171b;
+    --panel: #1d2126;
+    --panel-border: #323840;
+    --grid-line: #272c33;
+    --text-primary: #e9e6e0;
+    --text-dim: #868d96;
+    --amber: #f0a830;
+    --teal: #4fd1c5;
+    --rose: #ee6389;
+    --status-ok: #58d68d;
+    --status-bad: #e0615f;
+    --mono: ui-monospace, 'SF Mono', 'JetBrains Mono', 'Roboto Mono', Menlo, Consolas, monospace;
+  }
+
+  * { box-sizing: border-box; }
+
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text-primary);
+    font-family: var(--mono);
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .frame {
+    max-width: 720px;
+    margin: 0 auto;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    padding: 10px;
+    gap: 10px;
+  }
+
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--panel-border);
+    border-radius: 6px;
+  }
+
+  /* ---- Header --------------------------------------------------- */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 14px;
+  }
+  .brand {
+    font-size: 13px;
+    font-weight: 700;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: var(--text-primary);
+  }
+  .brand small {
+    display: block;
+    font-size: 9px;
+    letter-spacing: 0.1em;
+    color: var(--text-dim);
+    font-weight: 400;
+    margin-top: 2px;
+  }
+  .status {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    font-size: 10px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+  .status-led {
+    width: 9px;
+    height: 9px;
+    border-radius: 50%;
+    background: var(--status-bad);
+    box-shadow: 0 0 6px var(--status-bad);
+    transition: background 0.2s, box-shadow 0.2s;
+  }
+  .status-led.online {
+    background: var(--status-ok);
+    box-shadow: 0 0 6px var(--status-ok);
+    animation: pulse 2.2s ease-in-out infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.55; }
+  }
+
+  /* ---- Controls --------------------------------------------------- */
+  .controls {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    gap: 10px;
+    flex-wrap: wrap;
+  }
+  .axis-toggles {
+    display: flex;
+    gap: 6px;
+  }
+  .axis-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 6px 10px;
+    border-radius: 4px;
+    border: 1px solid var(--panel-border);
+    background: transparent;
+    cursor: pointer;
+    font-family: var(--mono);
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    color: var(--text-dim);
+    transition: border-color 0.15s, color 0.15s, background 0.15s;
+  }
+  .axis-toggle .dot {
+    width: 8px; height: 8px; border-radius: 50%;
+    background: currentColor;
+    opacity: 0.35;
+  }
+  .axis-toggle.active { color: var(--text-primary); }
+  .axis-toggle.active .dot { opacity: 1; }
+  .axis-toggle[data-axis="x"].active { border-color: var(--amber); }
+  .axis-toggle[data-axis="y"].active { border-color: var(--teal); }
+  .axis-toggle[data-axis="z"].active { border-color: var(--rose); }
+
+  #tareBtn {
+    padding: 8px 16px;
+    border-radius: 4px;
+    border: 1px solid var(--amber);
+    background: rgba(240, 168, 48, 0.08);
+    color: var(--amber);
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    cursor: pointer;
+  }
+  #tareBtn:active { background: rgba(240, 168, 48, 0.22); }
+
+  /* ---- FFT graph ---------------------------------------------------- */
+  .graph-panel { padding: 10px; }
+  .graph-head {
+    display: flex;
+    justify-content: space-between;
+    padding: 2px 6px 8px;
+    font-size: 9px;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+  #fftCanvas {
+    width: 100%;
+    height: 300px;
+    display: block;
+    border-radius: 3px;
+  }
+
+  /* ---- Stats strip ---------------------------------------------------- */
+  .stats {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px;
+  }
+  .stat-row {
+    display: grid;
+    grid-template-columns: 22px 1fr 1fr 1fr;
+    align-items: center;
+    gap: 8px;
+    padding: 8px 10px;
+    border-radius: 4px;
+    background: rgba(255,255,255,0.02);
+    border-left: 3px solid var(--panel-border);
+  }
+  .stat-row[data-axis="x"] { border-left-color: var(--amber); }
+  .stat-row[data-axis="y"] { border-left-color: var(--teal); }
+  .stat-row[data-axis="z"] { border-left-color: var(--rose); }
+  .stat-label {
+    font-weight: 700;
+    font-size: 12px;
+  }
+  .stat-row[data-axis="x"] .stat-label { color: var(--amber); }
+  .stat-row[data-axis="y"] .stat-label { color: var(--teal); }
+  .stat-row[data-axis="z"] .stat-label { color: var(--rose); }
+  .stat-field { display: flex; flex-direction: column; gap: 1px; }
+  .stat-field .k {
+    font-size: 8px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+  .stat-field .v {
+    font-size: 14px;
+    font-variant-numeric: tabular-nums;
+  }
+
+  footer {
+    padding: 8px 14px 16px;
+    text-align: center;
+    font-size: 9px;
+    letter-spacing: 0.06em;
+    color: var(--text-dim);
+  }
+</style>
+</head>
+<body>
+
+<div class="frame">
+
+  <header class="panel">
+    <div class="brand">Vibration DAQ<small>MPU6500 &middot; ESP32</small></div>
+    <div class="status">
+      <span id="statusLed" class="status-led"></span>
+      <span id="statusText">Connecting</span>
+    </div>
+  </header>
+
+  <div class="controls panel">
+    <div class="axis-toggles">
+      <button class="axis-toggle active" data-axis="x"><span class="dot"></span>X</button>
+      <button class="axis-toggle active" data-axis="y"><span class="dot"></span>Y</button>
+      <button class="axis-toggle active" data-axis="z"><span class="dot"></span>Z</button>
+    </div>
+    <button id="tareBtn">Tare / Recalibrate</button>
+  </div>
+
+  <div class="graph-panel panel">
+    <div class="graph-head">
+      <span id="graphMeta">-- Hz &middot; -- bins &middot; -- Hz/bin</span>
+      <span>FFT MAGNITUDE (m/s&sup2;)</span>
+    </div>
+    <canvas id="fftCanvas"></canvas>
+  </div>
+
+  <div class="stats panel">
+    <div class="stat-row" data-axis="x">
+      <div class="stat-label">X</div>
+      <div class="stat-field"><span class="k">RMS</span><span class="v" data-field="rms">--</span></div>
+      <div class="stat-field"><span class="k">Peak Freq</span><span class="v" data-field="peakF">--</span></div>
+      <div class="stat-field"><span class="k">Peak Mag</span><span class="v" data-field="peakM">--</span></div>
+    </div>
+    <div class="stat-row" data-axis="y">
+      <div class="stat-label">Y</div>
+      <div class="stat-field"><span class="k">RMS</span><span class="v" data-field="rms">--</span></div>
+      <div class="stat-field"><span class="k">Peak Freq</span><span class="v" data-field="peakF">--</span></div>
+      <div class="stat-field"><span class="k">Peak Mag</span><span class="v" data-field="peakM">--</span></div>
+    </div>
+    <div class="stat-row" data-axis="z">
+      <div class="stat-label">Z</div>
+      <div class="stat-field"><span class="k">RMS</span><span class="v" data-field="rms">--</span></div>
+      <div class="stat-field"><span class="k">Peak Freq</span><span class="v" data-field="peakF">--</span></div>
+      <div class="stat-field"><span class="k">Peak Mag</span><span class="v" data-field="peakM">--</span></div>
+    </div>
+  </div>
+
+  <footer>Tare after moving the device to a new surface or orientation.</footer>
+
+</div>
+
+<script>
+/* =====================================================================
+   DAQClient
+   Owns the WebSocket connection. Auto-reconnects with backoff so the
+   dashboard recovers on its own if the phone's WiFi radio naps or the
+   ESP32 reboots. Everything else in this file only talks to this class
+   through its callbacks -- swap the transport later without touching
+   the chart/stats code.
+   =====================================================================*/
+class DAQClient {
+  constructor(url, { onData, onStatusChange }) {
+    this.url = url;
+    this.onData = onData;
+    this.onStatusChange = onStatusChange;
+    this.ws = null;
+    this.reconnectDelayMs = 1000;
+    this._connect();
+  }
+
+  _connect() {
+    this.ws = new WebSocket(this.url);
+    this.ws.onopen = () => {
+      this.reconnectDelayMs = 1000;
+      this.onStatusChange(true);
+    };
+    this.ws.onclose = () => {
+      this.onStatusChange(false);
+      this._scheduleReconnect();
+    };
+    this.ws.onerror = () => {
+      this.ws.close();
+    };
+    this.ws.onmessage = (evt) => {
+      try {
+        const packet = JSON.parse(evt.data);
+        this.onData(packet);
+      } catch (err) {
+        console.error('bad packet', err);
+      }
+    };
+  }
+
+  _scheduleReconnect() {
+    setTimeout(() => this._connect(), this.reconnectDelayMs);
+    this.reconnectDelayMs = Math.min(this.reconnectDelayMs * 1.6, 8000);
+  }
+
+  sendCommand(cmd) {
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+      this.ws.send(cmd);
+    }
+  }
+}
+
+/* =====================================================================
+   FFTChart
+   Canvas-based spectrum display. No charting library -- keeps this
+   dependency-free (important since the ESP32 AP has no internet route
+   for a CDN) and fast. Auto-scales the magnitude axis with a slow decay
+   so the trace doesn't jump around on every frame.
+   =====================================================================*/
+class FFTChart {
+  constructor(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
+    this.colors = { x: '#f0a830', y: '#4fd1c5', z: '#ee6389' };
+    this.visible = { x: true, y: true, z: true };
+    this.maxMag = 0.05; // running auto-scale ceiling, decays slowly
+    this._resize();
+    window.addEventListener('resize', () => this._resize());
+  }
+
+  _resize() {
+    const rect = this.canvas.getBoundingClientRect();
+    const dpr = window.devicePixelRatio || 1;
+    this.canvas.width = Math.round(rect.width * dpr);
+    this.canvas.height = Math.round(rect.height * dpr);
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.w = rect.width;
+    this.h = rect.height;
+  }
+
+  setVisible(axis, visible) {
+    this.visible[axis] = visible;
+  }
+
+  render(packet) {
+    const ctx = this.ctx;
+    const { w, h } = this;
+    const pad = { l: 34, r: 10, t: 8, b: 18 };
+    const plotW = w - pad.l - pad.r;
+    const plotH = h - pad.t - pad.b;
+
+    ctx.clearRect(0, 0, w, h);
+
+    const nyquist = packet.fs / 2;
+    const bins = packet.n / 2;
+
+    // Auto-scale: track the tallest visible peak this frame, let the
+    // ceiling grow instantly but shrink slowly so it doesn't flicker.
+    let frameMax = 0.02;
+    for (const axis of ['x', 'y', 'z']) {
+      if (!this.visible[axis]) continue;
+      const a = packet.axes[axis];
+      if (a && a.peakM > frameMax) frameMax = a.peakM;
+    }
+    this.maxMag = frameMax > this.maxMag ? frameMax : this.maxMag * 0.9 + frameMax * 0.1;
+
+    // --- graticule -----------------------------------------------------
+    ctx.strokeStyle = '#272c33';
+    ctx.lineWidth = 1;
+    ctx.font = '9px ui-monospace, monospace';
+    ctx.fillStyle = '#868d96';
+
+    const freqStep = niceStep(nyquist, 6);
+    for (let f = 0; f <= nyquist; f += freqStep) {
+      const x = pad.l + (f / nyquist) * plotW;
+      ctx.beginPath();
+      ctx.moveTo(x, pad.t);
+      ctx.lineTo(x, pad.t + plotH);
+      ctx.stroke();
+      ctx.fillText(f.toFixed(0), x + 2, h - 5);
+    }
+
+    const magStep = niceStep(this.maxMag, 4);
+    for (let m = 0; m <= this.maxMag; m += magStep) {
+      const y = pad.t + plotH - (m / this.maxMag) * plotH;
+      ctx.beginPath();
+      ctx.moveTo(pad.l, y);
+      ctx.lineTo(pad.l + plotW, y);
+      ctx.stroke();
+      ctx.fillText(m.toFixed(2), 2, y + 3);
+    }
+
+    // --- traces ----------------------------------------------------------
+    for (const axis of ['x', 'y', 'z']) {
+      if (!this.visible[axis]) continue;
+      const a = packet.axes[axis];
+      if (!a || !a.mag) continue;
+      this._drawTrace(a.mag, bins, nyquist, pad, plotW, plotH, this.colors[axis]);
+      this._drawPeakMarker(a, nyquist, pad, plotW, plotH, this.colors[axis], axis);
+    }
+  }
+
+  _drawTrace(mag, bins, nyquist, pad, plotW, plotH, color) {
+    const ctx = this.ctx;
+    ctx.beginPath();
+    for (let i = 0; i < bins; i++) {
+      const freq = (i / bins) * nyquist;
+      const x = pad.l + (freq / nyquist) * plotW;
+      const yVal = Math.min(mag[i] / this.maxMag, 1);
+      const y = pad.t + plotH - yVal * plotH;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    }
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 1.6;
+    ctx.stroke();
+
+    // soft fill under the trace
+    ctx.lineTo(pad.l + plotW, pad.t + plotH);
+    ctx.lineTo(pad.l, pad.t + plotH);
+    ctx.closePath();
+    ctx.fillStyle = color + '18';
+    ctx.fill();
+  }
+
+  _drawPeakMarker(a, nyquist, pad, plotW, plotH, color) {
+    const ctx = this.ctx;
+    const x = pad.l + (a.peakF / nyquist) * plotW;
+    const yVal = Math.min(a.peakM / this.maxMag, 1);
+    const y = pad.t + plotH - yVal * plotH;
+    ctx.beginPath();
+    ctx.arc(x, y, 3, 0, Math.PI * 2);
+    ctx.fillStyle = color;
+    ctx.fill();
+  }
+}
+
+function niceStep(range, targetCount) {
+  const raw = range / targetCount;
+  const mag = Math.pow(10, Math.floor(Math.log10(raw || 1)));
+  const norm = raw / mag;
+  let step;
+  if (norm < 1.5) step = 1;
+  else if (norm < 3.5) step = 2;
+  else if (norm < 7.5) step = 5;
+  else step = 10;
+  return Math.max(step * mag, 0.001);
+}
+
+/* =====================================================================
+   StatsPanel
+   Pushes packet values into the readout DOM nodes.
+   =====================================================================*/
+class StatsPanel {
+  constructor(root) {
+    this.rows = {};
+    for (const axis of ['x', 'y', 'z']) {
+      const row = root.querySelector(`.stat-row[data-axis="${axis}"]`);
+      this.rows[axis] = {
+        rms: row.querySelector('[data-field="rms"]'),
+        peakF: row.querySelector('[data-field="peakF"]'),
+        peakM: row.querySelector('[data-field="peakM"]'),
+      };
+    }
+  }
+
+  update(packet) {
+    for (const axis of ['x', 'y', 'z']) {
+      const a = packet.axes[axis];
+      const el = this.rows[axis];
+      if (!a || !el) continue;
+      el.rms.textContent = a.rms.toFixed(2);
+      el.peakF.textContent = a.peakF.toFixed(1) + ' Hz';
+      el.peakM.textContent = a.peakM.toFixed(2);
+    }
+  }
+}
+
+/* =====================================================================
+   Dashboard
+   Wires the pieces together. This is the seam to extend later: add a
+   waveform strip, a spectrogram/waterfall, logging, alarm thresholds,
+   etc. by adding another class here and feeding it from onData().
+   =====================================================================*/
+class Dashboard {
+  constructor() {
+    this.chart = new FFTChart(document.getElementById('fftCanvas'));
+    this.stats = new StatsPanel(document.querySelector('.stats'));
+    this.statusLed = document.getElementById('statusLed');
+    this.statusText = document.getElementById('statusText');
+    this.graphMeta = document.getElementById('graphMeta');
+
+    this._bindControls();
+
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    this.client = new DAQClient(`${proto}://${location.host}/ws`, {
+      onData: (packet) => this._onData(packet),
+      onStatusChange: (connected) => this._onStatus(connected),
+    });
+  }
+
+  _bindControls() {
+    document.querySelectorAll('.axis-toggle').forEach((btn) => {
+      btn.addEventListener('click', () => {
+        const axis = btn.dataset.axis;
+        const active = !btn.classList.contains('active');
+        btn.classList.toggle('active', active);
+        this.chart.setVisible(axis, active);
+      });
+    });
+    document.getElementById('tareBtn').addEventListener('click', () => {
+      this.client.sendCommand('TARE');
+    });
+  }
+
+  _onData(packet) {
+    this.chart.render(packet);
+    this.stats.update(packet);
+    this.graphMeta.textContent =
+      `0-${(packet.fs / 2).toFixed(0)} Hz \u00b7 ${packet.n / 2} bins \u00b7 ${packet.df.toFixed(2)} Hz/bin`;
+  }
+
+  _onStatus(connected) {
+    this.statusLed.classList.toggle('online', connected);
+    this.statusText.textContent = connected ? 'Connected' : 'Reconnecting';
+  }
+}
+
+window.addEventListener('DOMContentLoaded', () => new Dashboard());
+</script>
+</body>
+</html>
